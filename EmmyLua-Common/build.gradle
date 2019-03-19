@@ -2,6 +2,8 @@ apply plugin: "java"
 apply plugin: 'kotlin'
 
 repositories {
+    google()
+    jcenter()
     mavenCentral()
 }
 

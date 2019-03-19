@@ -35,6 +35,7 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
     private val _rootWSFolders = mutableListOf<URI>()
     private val _baseFolders = mutableListOf<IFolder>()
     private var client: LuaLanguageClient? = null
+    private var exclude: List<String> = ArrayList()
 
     inner class WProject : UserDataHolderBase(), Project {
         override fun process(processor: Processor<PsiFile>) {
@@ -66,7 +67,8 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
                     removeFile(change.uri)
                     addFile(change.uri)
                 }
-                else -> { }
+                else -> {
+                }
             }
         }
     }
@@ -80,7 +82,7 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
         if (params.query.isBlank())
             return CompletableFuture.completedFuture(mutableListOf())
         val matcher = CamelHumpMatcher(params.query, false)
-        return computeAsync { cancel->
+        return computeAsync { cancel ->
             val list = mutableListOf<SymbolInformation>()
             LuaShortNameIndex.processValues(project, GlobalSearchScope.projectScope(project), Processor {
                 cancel.checkCanceled()
@@ -192,7 +194,20 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
 
     private fun collectFiles(file: File, list: MutableList<File>) {
         if (file.isFile && file.extension == "lua") {
-            list.add(file)
+            val f = file.path.replace("\\", "/").replace("//", "/").toLowerCase()
+            var sig = false
+            for (i in 0..exclude.size - 1) {
+                val ff = exclude.get(i)
+                if (f.startsWith(ff)) {
+                    sig = true
+                    break
+                }
+            }
+            if (sig) {
+                // been excluded.
+            } else {
+                list.add(file)
+            }
         } else if (file.isDirectory) {
             file.listFiles().forEach { collectFiles(it, list) }
         }
@@ -229,7 +244,7 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
 
         allFiles.forEachIndexed { index, file ->
             val findFile = findFile(file.toURI().toString())
-            monitor.setProgress("Emmy load file: ${file.canonicalPath}", (index + 1) / allFiles.size.toFloat())
+            monitor.setProgress(file.canonicalPath, (index + 1) / allFiles.size.toFloat())
             if (findFile == null)
                 addFile(file)
         }
@@ -285,6 +300,10 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
     override fun removeFile(uri: String) {
         val file = findFile(uri)
         file?.let { it.parent.removeFile(it) }
+    }
+
+    fun setExclude(exclude: List<String>) {
+        this.exclude = exclude
     }
 
     fun connect(client: LuaLanguageClient) {

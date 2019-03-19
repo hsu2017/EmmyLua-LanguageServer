@@ -20,6 +20,7 @@ import org.eclipse.lsp4j.services.LanguageServer
 import org.eclipse.lsp4j.services.WorkspaceService
 import java.util.*
 import java.util.concurrent.CompletableFuture
+import kotlin.collections.ArrayList
 
 /**
  * tangzx
@@ -69,6 +70,15 @@ class LuaLanguageServer : LanguageServer, LanguageClientAware {
                 workspaceService.addRoot(stdFolder.asString)
             val workspaceFolders = json["workspaceFolders"] as? JsonArray
             workspaceFolders?.forEach { workspaceService.addRoot(it.asString) }
+            val exclude = json["exclude"] as? JsonArray
+            if (exclude != null) {
+                val ls = ArrayList<String>()
+                for (i in 0..exclude.size() - 1) {
+                    var o = exclude.get(i).asString
+                    ls.add(o);
+                }
+                workspaceService.setExclude(ls)
+            }
         }
 
         val res = InitializeResult()

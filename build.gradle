@@ -1,18 +1,24 @@
-
 def src = "D:/Git/OpenSource/EmmyLua/IntelliJ-EmmyLua/src/main/java/"
 def dst = file("EmmyLua-Common/src/main/java")
 
 task copyCoreFiles() {
-	doLast {
-		fileTree(dst).each {
-			def path = it.path.substring(dst.path.length() + 1)
-			def srcFile = src + path
-			if (file(srcFile).exists()) {
-				println("copy file : " + srcFile)
-				ant.copy(file:srcFile, tofile:it.path)
-			} else {
-				println("---> can't resolve file : " + srcFile)
-			}
-		}
-	}
+    doLast {
+        fileTree(dst).each {
+            def path = it.path.substring(dst.path.length() + 1)
+            def srcFile = src + path
+            if (file(srcFile).exists()) {
+                println("copy file : " + srcFile)
+                ant.copy(file: srcFile, tofile: it.path)
+            } else {
+                println("---> can't resolve file : " + srcFile)
+            }
+        }
+    }
+}
+
+gradle.buildFinished {
+    copy {
+        from "I:/Collect/EmmyLua-LanguageServer/EmmyLua-LS/build/libs/EmmyLua-LS-all.jar"
+        into "I:/Collect/luaide-lite/res/emmy/"
+    }
 }
