@@ -18,7 +18,7 @@ task copyCoreFiles() {
 
 gradle.buildFinished {
     copy {
-        from "I:/Collect/EmmyLua-LanguageServer/EmmyLua-LS/build/libs/EmmyLua-LS-all.jar"
-        into "I:/Collect/luaide-lite/res/emmy/"
+        from "G:/Collect/EmmyLua/EmmyLua-LanguageServer-Fork/EmmyLua-LS/build/libs/EmmyLua-LS-all.jar"
+        into "G:/Collect/luaide-lite/res/emmy/"
     }
 }

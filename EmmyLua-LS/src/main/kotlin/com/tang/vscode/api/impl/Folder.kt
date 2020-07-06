@@ -1,12 +1,12 @@
 package com.tang.vscode.api.impl
 
-import com.tang.vscode.api.IFolder
-import com.tang.vscode.api.ILuaFile
-import com.tang.vscode.api.IVirtualFile
-import java.nio.file.Path
+import com.tang.lsp.FileURI
+import com.tang.lsp.IFolder
+import com.tang.lsp.ILuaFile
+import com.tang.lsp.IVirtualFile
 
-open class Folder(uri: Path, private val myName: String? = null)
-    : VirtualFileBase(uri), IFolder {
+open class Folder(fileURI: FileURI, private val myName: String? = null)
+    : VirtualFileBase(fileURI), IFolder {
 
     private val children = mutableListOf<IVirtualFile>()
 
@@ -44,7 +44,7 @@ open class Folder(uri: Path, private val myName: String? = null)
     }
 
     override fun findFile(name: String): IVirtualFile? {
-        return children.find { it.getName() == name }
+        return children.find { it.getName().toLowerCase() == name.toLowerCase() }
     }
 
     override fun findFile(vararg names: String): IVirtualFile? {
@@ -66,7 +66,7 @@ open class Folder(uri: Path, private val myName: String? = null)
     override fun getFile(name: String, recursive: Boolean): IVirtualFile? {
         var f: IVirtualFile? = null
         walkFiles {
-            if (it.path.endsWith(name)) {
+            if (it.uri.endsWith(name)) {
                 f = it
                 return@walkFiles false
             }
@@ -79,7 +79,7 @@ open class Folder(uri: Path, private val myName: String? = null)
         get() = true
 
     override fun addFile(name: String, text: CharSequence): ILuaFile {
-        val luaFile = LuaFile(this.path.resolve(name))
+        val luaFile = LuaFile(uri.resolve(name, false))
         luaFile.text = text
         addFile(luaFile)
         return luaFile
@@ -99,8 +99,7 @@ open class Folder(uri: Path, private val myName: String? = null)
     }
 
     override fun createFolder(name: String): IFolder {
-        val u = path.resolve(name)
-        val folder = Folder(u)
+        val folder = Folder(uri.resolve(name, true))
         addFile(folder)
         return folder
     }

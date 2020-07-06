@@ -17,6 +17,9 @@
 package com.tang.intellij.lua.ty
 
 import com.intellij.openapi.project.Project
+import com.tang.intellij.lua.Constants
+import com.tang.intellij.lua.psi.LuaCallExpr
+import com.tang.intellij.lua.psi.prefixExpr
 import com.tang.intellij.lua.search.SearchContext
 
 interface ITySubstitutor {
@@ -57,7 +60,7 @@ class GenericAnalyzer(arg: ITy, private val par: ITy) : TyVisitor() {
     }
 
     override fun visitFun(f: ITyFunction) {
-        TyUnion.each(cur) { it ->
+        TyUnion.each(cur) {
             if (it is ITyFunction) {
                 visitSig(it.mainSignature, f.mainSignature)
             }
@@ -111,13 +114,23 @@ open class TySubstitutor : ITySubstitutor {
     }
 }
 
-class TyAliasSubstitutor(val project: Project) : ITySubstitutor {
+class TyAliasSubstitutor private constructor(val project: Project) : ITySubstitutor {
+    companion object {
+        fun substitute(ty: ITy, context: SearchContext): ITy {
+            /*if (context.forStub)
+                return ty*/
+            return ty.substitute(TyAliasSubstitutor(context.project))
+        }
+    }
+
     override fun substitute(function: ITyFunction): ITy {
-        return function
+        return TySerializedFunction(function.mainSignature.substitute(this),
+                function.signatures.map { it.substitute(this) }.toTypedArray(),
+                function.flags)
     }
 
     override fun substitute(clazz: ITyClass): ITy {
-        return clazz.recoverAlias(SearchContext(project), this)
+        return clazz.recoverAlias(SearchContext.get(project), this)
     }
 
     override fun substitute(generic: ITyGeneric): ITy {
@@ -127,5 +140,17 @@ class TyAliasSubstitutor(val project: Project) : ITySubstitutor {
     override fun substitute(ty: ITy): ITy {
         return ty
     }
+}
 
+class TySelfSubstitutor(val project: Project, val call: LuaCallExpr?, val self: ITy? = null) : TySubstitutor() {
+    private val selfType: ITy by lazy {
+        self ?: (call?.prefixExpr?.guessType(SearchContext.get(project)) ?: Ty.UNKNOWN)
+    }
+
+    override fun substitute(clazz: ITyClass): ITy {
+        if (clazz.className == Constants.WORD_SELF) {
+            return selfType
+        }
+        return super.substitute(clazz)
+    }
 }

@@ -4,26 +4,28 @@ import com.google.gson.JsonObject
 import com.intellij.codeInsight.completion.impl.CamelHumpMatcher
 import com.intellij.openapi.fileEditor.impl.LoadTextUtil
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.project.ProjectCoreUtil
 import com.intellij.openapi.util.UserDataHolderBase
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiNamedElement
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.util.Processor
+import com.tang.intellij.lua.IVSCodeSettings
+import com.tang.intellij.lua.configuration.IConfigurationManager
+import com.tang.intellij.lua.fs.FileManager
+import com.tang.intellij.lua.fs.IFileManager
 import com.tang.intellij.lua.stubs.index.LuaShortNameIndex
-import com.tang.vscode.api.IFolder
-import com.tang.vscode.api.ILuaFile
-import com.tang.vscode.api.IVirtualFile
-import com.tang.vscode.api.IWorkspace
+import com.tang.lsp.*
 import com.tang.vscode.api.impl.Folder
 import com.tang.vscode.api.impl.LuaFile
+import com.tang.vscode.configuration.ConfigurationManager
 import com.tang.vscode.utils.computeAsync
 import com.tang.vscode.utils.getSymbol
 import org.eclipse.lsp4j.*
+import org.eclipse.lsp4j.jsonrpc.services.JsonRequest
 import org.eclipse.lsp4j.services.WorkspaceService
 import java.io.File
 import java.net.URI
-import java.nio.file.Path
-import java.nio.file.Paths
 import java.util.concurrent.CompletableFuture
 
 /**
@@ -31,15 +33,15 @@ import java.util.concurrent.CompletableFuture
  * Created by Client on 2018/3/20.
  */
 class LuaWorkspaceService : WorkspaceService, IWorkspace {
-    private val _rootList = mutableListOf<IFolder>()
-    private val _rootWSFolders = mutableListOf<URI>()
-    private val _baseFolders = mutableListOf<IFolder>()
+    private val rootList = mutableListOf<IFolder>()
+    private val schemeMap = mutableMapOf<String, IFolder>()
+    private val configurationManager = ConfigurationManager()
     private var client: LuaLanguageClient? = null
     private var exclude: List<String> = ArrayList()
 
     inner class WProject : UserDataHolderBase(), Project {
         override fun process(processor: Processor<PsiFile>) {
-            for (ws in _rootList) {
+            for (ws in rootList) {
                 val continueRun = ws.walkFiles {
                     val psi = it.psi
                     if (psi != null)
@@ -51,11 +53,14 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
         }
     }
 
-    val project: Project
+    private val project: Project = WProject()
+
+    private val fileManager = FileManager(project)
+    private val fileScopeProvider = WorkspaceRootFileScopeProvider()
 
     init {
-        project = WProject()
         project.putUserData(IWorkspace.KEY, this)
+        fileManager.addProvider(fileScopeProvider)
     }
 
     override fun didChangeWatchedFiles(params: DidChangeWatchedFilesParams) {
@@ -63,26 +68,39 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
             when (change.type) {
                 FileChangeType.Created -> addFile(change.uri)
                 FileChangeType.Deleted -> removeFile(change.uri)
-                FileChangeType.Changed -> {
+                /*FileChangeType.Changed -> {
                     removeFile(change.uri)
                     addFile(change.uri)
-                }
-                else -> {
-                }
+                }*/
+                else -> { }
             }
         }
     }
 
     override fun didChangeConfiguration(params: DidChangeConfigurationParams) {
         val settings = params.settings as? JsonObject ?: return
-        Configuration.update(settings)
+        val ret = VSCodeSettings.update(settings)
+        if (ret.associationChanged) {
+            loadWorkspace()
+        }
+    }
+
+    fun initConfigFiles(files: Array<EmmyConfigurationSource>) {
+        configurationManager.init(files)
+    }
+
+    @JsonRequest("emmy/updateConfig")
+    fun updateConfig(params: UpdateConfigParams): CompletableFuture<Void> {
+        configurationManager.updateConfiguration(params)
+        loadWorkspace()
+        return CompletableFuture()
     }
 
     override fun symbol(params: WorkspaceSymbolParams): CompletableFuture<MutableList<out SymbolInformation>> {
         if (params.query.isBlank())
             return CompletableFuture.completedFuture(mutableListOf())
         val matcher = CamelHumpMatcher(params.query, false)
-        return computeAsync { cancel ->
+        return computeAsync { cancel->
             val list = mutableListOf<SymbolInformation>()
             LuaShortNameIndex.processValues(project, GlobalSearchScope.projectScope(project), Processor {
                 cancel.checkCanceled()
@@ -108,41 +126,28 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
     }
 
     override fun eachRoot(processor: (ws: IFolder) -> Boolean) {
-        for (root in _rootList) {
+        for (root in rootList) {
             if (!processor(root))
                 break
         }
     }
 
-    private fun getWSRoot(uri: URI): IFolder {
-        var ws: IFolder? = null
-        eachRoot {
-            if (it.matchUri(uri)) {
-                ws = it
-                return@eachRoot false
-            }
-            true
+    private fun getSchemeFolder(path: FileURI, autoCreate: Boolean): IFolder? {
+        var folder: IFolder? = schemeMap[path.scheme]
+        if (folder == null && autoCreate) {
+            folder = Folder(FileURI("${path.scheme}:/", true))
+            schemeMap[path.scheme] = folder
         }
-        return ws ?: addWSRoot(uri)
+        return folder
     }
 
-    private fun findOrCreate(path: Path, autoCreate: Boolean): Pair<IFolder?, Boolean> {
+    private fun findOrCreate(path: FileURI, autoCreate: Boolean): Pair<IFolder?, Boolean> {
         var isCreated = false
-
-        val driver = path.root
-        val base = _baseFolders.find { it.path == driver }
-        var folder = base ?: if (autoCreate) {
-            val newBase = Folder(driver, driver.toFile().name)
-            _baseFolders.add(newBase)
-            isCreated = true
-            newBase
-        } else null
-
+        var folder = getSchemeFolder(path, autoCreate)
         if (folder == null)
-            return Pair(folder, false)
-
+            return Pair(folder, isCreated)
         for (i in 0 until path.nameCount) {
-            val name = path.getName(i).toFile().name
+            val name = path.getName(i)
             val find = folder?.findFile(name) as? IFolder
             folder = if (find != null) find else {
                 val create = folder?.createFolder(name)
@@ -150,103 +155,104 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
                 create
             }
         }
-
         return Pair(folder, isCreated)
     }
 
-    private fun addWSRoot(uri: URI): IFolder {
-        val path = Paths.get(uri)
-        val exist = _rootList.find { it.path == path }
+    private fun addRoot(fileURI: FileURI): IFolder {
+        val exist = rootList.find { it.uri == fileURI }
         if (exist != null) return exist
 
-        val pair = findOrCreate(path, true)
+        val pair = findOrCreate(fileURI, true)
         val folder = pair.first!!
         if (pair.second)
-            _rootList.add(folder)
+            rootList.add(folder)
         return folder
     }
 
     private fun removeRoot(uri: String) {
-        val path = Paths.get(URI(uri))
-        _rootList.removeIf { folder ->
-            if (folder.path == path) {
-                folder.walkFiles {
-                    it.unindex()
-                    true
-                }
-                folder.parent.removeFile(folder)
+        val path = FileURI(uri, true)
+        rootList.removeIf { folder ->
+            if (folder.uri == path) {
+                fileScopeProvider.removeRoot(path)
+                removeFolder(folder)
                 return@removeIf true
             }
             false
         }
     }
 
+    private fun removeFolder(folder: IFolder) {
+        folder.walkFiles {
+            it.unindex()
+            true
+        }
+        folder.parent.removeFile(folder)
+    }
+
     fun addRoot(uri: String) {
-        addRoot(URI(uri))
+        fileScopeProvider.addRoot(FileURI(uri, true))
     }
 
-    private fun addRoot(uri: URI) {
-        if (_rootWSFolders.contains(uri))
-            return
-        getWSRoot(uri)
-        _rootWSFolders.add(uri)
-    }
-
-    private fun collectFiles(file: File, list: MutableList<File>) {
-        if (file.isFile && file.extension == "lua") {
-            val f = file.path.replace("\\", "/").replace("//", "/").toLowerCase()
-            var sig = false
-            for (i in 0..exclude.size - 1) {
-                val ff = exclude.get(i)
-                if (f.startsWith(ff)) {
-                    sig = true
-                    break
+    private fun cleanWorkspace() {
+        val removeList = mutableListOf<ILuaFile>()
+        project.process { psiFile ->
+            val file = psiFile.virtualFile
+            if (file is ILuaFile) {
+                if (fileManager.isExclude(file.uri)) {
+                    removeList.add(file)
                 }
             }
-            if (sig) {
-                // been excluded.
-            } else {
-                list.add(file)
-            }
-        } else if (file.isDirectory) {
-            file.listFiles().forEach { collectFiles(it, list) }
+            true
+        }
+        removeList.forEach {
+            it.parent.removeFile(it)
         }
     }
 
     fun loadWorkspace() {
+        cleanWorkspace()
         loadWorkspace(object : IProgressMonitor {
             override fun done() {
-                client?.progressReport(ProgressReport("Finished!", 1f))
+                if (VSCodeSettings.isVSCode)
+                    client?.progressReport(ProgressReport("Finished!", 1f))
             }
 
             override fun setProgress(text: String, percent: Float) {
-                client?.progressReport(ProgressReport(text, percent))
+                if (VSCodeSettings.isVSCode)
+                    client?.progressReport(ProgressReport(text, percent))
             }
         })
     }
 
     private fun loadWorkspace(monitor: IProgressMonitor) {
         monitor.setProgress("load workspace folders", 0f)
-        client?.workspaceFolders()?.whenCompleteAsync { wsFolders, _ ->
-            wsFolders?.forEach { addRoot(it.uri) }
-            loadWorkspaceImpl(monitor)
-        }
-    }
-
-    private fun loadWorkspaceImpl(monitor: IProgressMonitor) {
-        val allFiles = mutableListOf<File>()
-        val arr = _rootWSFolders.toTypedArray()
-        _rootWSFolders.clear()
-        arr.forEach { uri ->
-            val folder = File(uri.path)
-            collectFiles(folder, allFiles)
-        }
-
-        allFiles.forEachIndexed { index, file ->
-            val findFile = findFile(file.toURI().toString())
-            monitor.setProgress(file.canonicalPath, (index + 1) / allFiles.size.toFloat())
-            if (findFile == null)
-                addFile(file)
+        val collections = fileManager.findAllFiles()
+        var totalFileCount = 0f
+        var processedCount = 0f
+        collections.forEach { totalFileCount += it.files.size }
+        for (collection in collections) {
+            addRoot(collection.root)
+            for (uri in collection.files) {
+                val file = uri.toFile()
+                if (file != null) {
+                    val f = file.path.replace("\\", "/").replace("//", "/").toLowerCase()
+                    var sig = false
+                    for (i in 0..exclude.size - 1) {
+                        val ff = exclude.get(i)
+                        if (f.startsWith(ff)) {
+                            sig = true
+                            break
+                        }
+                    }
+                    if (sig) {
+                        // been excluded.
+                    } else{
+                        processedCount++
+                        monitor.setProgress(file.canonicalPath, processedCount / totalFileCount)
+                        addFile(uri, null)
+                    }
+                }
+            }
         }
         monitor.done()
         sendAllDiagnostics()
@@ -266,40 +272,84 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
     }
 
     override fun findFile(uri: String): IVirtualFile? {
-        val u = URI(uri)
-        if (u.scheme != "file")
-            return null
-
-        val path = Paths.get(u)
-        val pair = findOrCreate(path.parent, false)
-        val root = pair.first
-        return root?.findFile(path.toFile().name)
+        val fileURI = FileURI(uri, false)
+        return findFile(fileURI)
     }
 
-    override fun addFile(file: File, text: String?): ILuaFile? {
-        val path = file.toPath()
-        val pair = findOrCreate(path.parent, true)
-        val root = pair.first!!
-        val content: CharSequence
-        try {
-            content = text ?: LoadTextUtil.getTextByBinaryPresentation(file.readBytes())
-        } catch (e: Exception) {
-            System.err.println("Invalidate lua file: ${file.canonicalPath}")
+    override fun findLuaFile(uri: String): ILuaFile? {
+        return findFile(uri) as? ILuaFile
+    }
+
+    private fun findFile(fileURI: FileURI): IVirtualFile? {
+        val parent = fileURI.parent
+        val folder: IFolder? = if (parent == null)
+            getSchemeFolder(fileURI, false)
+        else
+            findOrCreate(parent, false).first
+        return folder?.findFile(fileURI.name)
+    }
+
+    private fun addDirectory(file: File) {
+        if (file.isDirectory) {
+            file.listFiles()?.forEach {
+                addFile(it)
+            }
+        }
+    }
+
+    override fun addFile(file: File, text: String?, force: Boolean): ILuaFile? {
+        if (file.isDirectory) {
+            addDirectory(file)
             return null
         }
-        return root.addFile(file.name, content)
+        val fileURI = FileURI(file.toURI(), false)
+        return addFile(fileURI, text, force)
+    }
+
+    private fun addFile(fileURI: FileURI, text: String?, force: Boolean = false): ILuaFile? {
+        val file = fileURI.toFile()
+        if (file == null || (!force && !fileManager.isInclude(fileURI))) {
+            return null
+        }
+        val existFile = findFile(fileURI)
+        if (existFile is ILuaFile) {
+            return existFile
+        }
+
+        val parent = fileURI.parent
+        val folder: IFolder = (if (parent == null)
+            getSchemeFolder(fileURI, true)
+        else
+            findOrCreate(parent, true).first) ?: return null
+
+        return try {
+            val content = text ?: LoadTextUtil.getTextByBinaryPresentation(file.readBytes())
+            folder.addFile(file.name, content)
+        } catch (e: Exception) {
+            System.err.println("Invalidate lua file: ${file.canonicalPath}")
+            null
+        }
     }
 
     private fun addFile(uri: String) {
         val u = URI(uri)
-        if (u.scheme != "file")
-            return
         addFile(File(u.path))
     }
 
     override fun removeFile(uri: String) {
         val file = findFile(uri)
-        file?.let { it.parent.removeFile(it) }
+        file?.let {
+            it.parent.removeFile(it)
+        }
+    }
+
+    override fun removeFileIfNeeded(uri: String) {
+        val file = findFile(uri)
+        file?.let {
+            if (!fileManager.isInclude(file.uri)) {
+                it.parent.removeFile(it)
+            }
+        }
     }
 
     fun setExclude(exclude: List<String>) {
@@ -311,8 +361,15 @@ class LuaWorkspaceService : WorkspaceService, IWorkspace {
     }
 
     fun dispose() {
-        _rootWSFolders.clear()
-        _rootList.forEach { it.removeAll() }
-        _rootList.clear()
+        schemeMap.clear()
+        rootList.forEach { it.removeAll() }
+        rootList.clear()
+    }
+
+    fun initIntellijEnv() {
+        ProjectCoreUtil.theProject = project
+        project.putUserData(IVSCodeSettings.KEY, VSCodeSettings)
+        project.putUserData(IConfigurationManager.KEY, configurationManager)
+        project.putUserData(IFileManager.KEY, fileManager)
     }
 }

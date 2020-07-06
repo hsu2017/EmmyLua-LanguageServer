@@ -5,11 +5,9 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonPrimitive
 import com.intellij.core.LanguageParserDefinitions
 import com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistry
-import com.tang.intellij.lua.ext.ILuaFileResolver
+import com.tang.intellij.lua.plugin.PluginManager
 import com.tang.intellij.lua.lang.LuaLanguage
 import com.tang.intellij.lua.lang.LuaParserDefinition
-import com.tang.intellij.lua.psi.search.LuaShortNamesManager
-import com.tang.intellij.lua.psi.search.LuaShortNamesManagerImpl
 import com.tang.intellij.lua.reference.LuaReferenceContributor
 import com.tang.vscode.utils.computeAsync
 import org.eclipse.lsp4j.*
@@ -49,11 +47,10 @@ class LuaLanguageServer : LanguageServer, LanguageClientAware {
     }
 
     private fun initIntellijEnv() {
+        PluginManager.init()
         LanguageParserDefinitions.INSTANCE.register(LuaLanguage.INSTANCE, LuaParserDefinition())
-        documentService.initIntellijEnv()
+        workspaceService.initIntellijEnv()
         ReferenceProvidersRegistry.register(LuaReferenceContributor())
-        ILuaFileResolver.EP_NAME.add(LuaFileResolver())
-        LuaShortNamesManager.EP_NAME.add(LuaShortNamesManagerImpl())
     }
 
     override fun initialize(params: InitializeParams): CompletableFuture<InitializeResult> {
@@ -62,7 +59,6 @@ class LuaLanguageServer : LanguageServer, LanguageClientAware {
 
         initIntellijEnv()
 
-
         val json = params.initializationOptions as? JsonObject
         if (json != null) {
             val stdFolder = json["stdFolder"] as? JsonPrimitive
@@ -70,7 +66,16 @@ class LuaLanguageServer : LanguageServer, LanguageClientAware {
                 workspaceService.addRoot(stdFolder.asString)
             val workspaceFolders = json["workspaceFolders"] as? JsonArray
             workspaceFolders?.forEach { workspaceService.addRoot(it.asString) }
-            val exclude = json["exclude"] as? JsonArray
+            val clientType = json["client"] as? JsonPrimitive
+            if (clientType != null)
+                VSCodeSettings.clientType = clientType.asString
+            // lua config files
+            val configFileArray = json["configFiles"] as? JsonArray
+            if (configFileArray != null) {
+                val configFiles = EmmyConfigurationSource.parse(configFileArray)
+                workspaceService.initConfigFiles(configFiles)
+            }
+	        val exclude = json["exclude"] as? JsonArray
             if (exclude != null) {
                 val ls = ArrayList<String>()
                 for (i in 0..exclude.size() - 1) {
@@ -104,7 +109,7 @@ class LuaLanguageServer : LanguageServer, LanguageClientAware {
         capabilities.workspace.workspaceFolders.supported = true
         capabilities.workspace.workspaceFolders.changeNotifications = Either.forLeft(WORKSPACE_FOLDERS_CAPABILITY_ID)
 
-        capabilities.textDocumentSync = Either.forLeft(TextDocumentSyncKind.Incremental)
+        capabilities.textDocumentSync = Either.forLeft(TextDocumentSyncKind.Full)
 
         res.capabilities = capabilities
         return CompletableFuture.completedFuture(res)

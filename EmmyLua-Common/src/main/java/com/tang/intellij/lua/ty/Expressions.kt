@@ -27,9 +27,12 @@ import com.tang.intellij.lua.project.LuaSettings
 import com.tang.intellij.lua.psi.*
 import com.tang.intellij.lua.psi.impl.LuaNameExprMixin
 import com.tang.intellij.lua.psi.search.LuaShortNamesManager
+import com.tang.intellij.lua.search.GuardType
 import com.tang.intellij.lua.search.SearchContext
 
 fun inferExpr(expr: LuaExpr?, context: SearchContext): ITy {
+    if (expr == null)
+        return Ty.UNKNOWN
     if (expr is LuaIndexExpr || expr is LuaNameExpr) {
         val tree = LuaDeclarationTree.get(expr.containingFile)
         val declaration = tree.find(expr)?.firstDeclaration?.psi
@@ -37,6 +40,10 @@ fun inferExpr(expr: LuaExpr?, context: SearchContext): ITy {
             return declaration.guessType(context)
         }
     }
+    return inferExprInner(expr, context)
+}
+
+private fun inferExprInner(expr: LuaPsiElement, context: SearchContext): ITy {
     return when (expr) {
         is LuaUnaryExpr -> expr.infer(context)
         is LuaBinaryExpr -> expr.infer(context)
@@ -47,7 +54,6 @@ fun inferExpr(expr: LuaExpr?, context: SearchContext): ITy {
         is LuaNameExpr -> expr.infer(context)
         is LuaLiteralExpr -> expr.infer()
         is LuaIndexExpr -> expr.infer(context)
-        null -> Ty.UNKNOWN
         else -> Ty.UNKNOWN
     }
 }
@@ -70,9 +76,8 @@ private fun LuaBinaryExpr.infer(context: SearchContext): ITy {
         val nextVisibleLeaf = PsiTreeUtil.nextVisibleLeaf(firstChild)
         nextVisibleLeaf?.node?.elementType
     }
-    var ty: ITy = Ty.UNKNOWN
-    operator.let {
-        ty = when (it) {
+    return operator.let {
+        when (it) {
         //..
             LuaTypes.CONCAT -> Ty.STRING
         //<=, ==, <, ~=, >=, >
@@ -85,7 +90,6 @@ private fun LuaBinaryExpr.infer(context: SearchContext): ITy {
             else -> Ty.UNKNOWN
         }
     }
-    return ty
 }
 
 private fun guessAndOrType(binaryExpr: LuaBinaryExpr, operator: IElementType?, context:SearchContext): ITy {
@@ -108,11 +112,18 @@ private fun guessBinaryOpType(binaryExpr : LuaBinaryExpr, context:SearchContext)
 
 fun LuaCallExpr.createSubstitutor(sig: IFunSignature, context: SearchContext): ITySubstitutor? {
     if (sig.isGeneric()) {
-        val list = this.argList.map { it.guessType(context.clone()) }
+        val list = mutableListOf<ITy>()
+        // self type
+        if (this.isMethodColonCall) {
+            this.prefixExpr?.let { prefix ->
+                list.add(prefix.guessType(context))
+            }
+        }
+        this.argList.map { list.add(it.guessType(context)) }
         val map = mutableMapOf<String, ITy>()
         var processedIndex = -1
         sig.tyParameters.forEach { map[it.name] = Ty.UNKNOWN }
-        sig.processArgs(this) { index, param ->
+        sig.processArgs { index, param ->
             val arg = list.getOrNull(index)
             if (arg != null) {
                 GenericAnalyzer(arg, param.ty).analyze(map)
@@ -140,12 +151,9 @@ fun LuaCallExpr.createSubstitutor(sig: IFunSignature, context: SearchContext): I
 }
 
 private fun LuaCallExpr.getReturnTy(sig: IFunSignature, context: SearchContext): ITy? {
-    var resultSig = sig
     val substitutor = createSubstitutor(sig, context)
-    if (substitutor != null) {
-        resultSig = sig.substitute(substitutor)
-    }
-    val returnTy = resultSig.returnTy
+    var returnTy = if (substitutor != null) sig.returnTy.substitute(substitutor) else sig.returnTy
+    returnTy = returnTy.substitute(TySelfSubstitutor(project, this))
     return if (returnTy is TyTuple) {
         if (context.guessTuple())
             returnTy
@@ -162,7 +170,7 @@ private fun LuaCallExpr.infer(context: SearchContext): ITy {
     // xxx()
     val expr = luaCallExpr.expr
     // 从 require 'xxx' 中获取返回类型
-    if (expr is LuaNameExpr && expr.name == Constants.WORD_REQUIRE) {
+    if (expr is LuaNameExpr && LuaSettings.isRequireLikeFunctionName(expr.name)) {
         var filePath: String? = null
         val string = luaCallExpr.firstStringArg
         if (string is LuaLiteralExpr) {
@@ -209,10 +217,17 @@ private fun LuaCallExpr.infer(context: SearchContext): ITy {
 private fun LuaNameExpr.infer(context: SearchContext): ITy {
     val set = recursionGuard(this, Computable {
         var type:ITy = Ty.UNKNOWN
-        val multiResolve = multiResolve(this, context)
-        multiResolve.forEach {
-            val set = getType(context, it)
-            type = type.union(set)
+
+        context.withRecursionGuard(this, GuardType.GlobalName) {
+            val multiResolve = multiResolve(this, context)
+            var maxTimes = 10
+            for (element in multiResolve) {
+                val set = getType(context, element)
+                type = type.union(set)
+                if (--maxTimes == 0)
+                    break
+            }
+            type
         }
 
         /**
@@ -257,7 +272,7 @@ private fun getType(context: SearchContext, def: PsiElement): ITy {
 
             var type: ITy = def.docTy ?: Ty.UNKNOWN
             //guess from value expr
-            if (Ty.isInvalid(type) && !context.forStore) {
+            if (Ty.isInvalid(type) /*&& !context.forStub*/) {
                 val stat = def.assignStat
                 if (stat != null) {
                     val exprList = stat.valueExprList
@@ -272,7 +287,7 @@ private fun getType(context: SearchContext, def: PsiElement): ITy {
             //Global
             if (isGlobal(def) && type !is ITyPrimitive) {
                 //use globalClassTy to store class members, that's very important
-                type = type.union(TyClass.createGlobalType(def, context.forStore))
+                type = type.union(TyClass.createGlobalType(def, context.forStub))
             }
             return type
         }
@@ -344,11 +359,12 @@ private fun LuaIndexExpr.infer(context: SearchContext): ITy {
         val propName = indexExpr.name
         if (propName != null) {
             val prefixType = parentTy ?: indexExpr.guessParentType(context)
-
-            prefixType.eachTopClass(Processor {
-                result = result.union(guessFieldType(propName, it, context))
-                true
-            })
+            prefixType.each { ty ->
+                if (ty is ITyClass)
+                    result = result.union(guessFieldType(propName, ty, context))
+                else if (ty is ITyGeneric && ty.getParamTy(0) == Ty.STRING)
+                    result = result.union(ty.getParamTy(1))
+            }
         }
         result
     })

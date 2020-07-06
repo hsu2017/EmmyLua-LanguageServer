@@ -1,4 +1,4 @@
-package com.tang.vscode.api
+package com.tang.lsp
 
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Key
@@ -7,12 +7,13 @@ import org.eclipse.lsp4j.Diagnostic
 import org.eclipse.lsp4j.DidChangeTextDocumentParams
 import java.io.File
 import java.net.URI
-import java.nio.file.Path
 
 interface IWorkspace {
-    fun addFile(file: File, text: String? = null): ILuaFile?
+    fun addFile(file: File, text: String? = null, force: Boolean = false): ILuaFile?
     fun findFile(uri: String): IVirtualFile?
+    fun findLuaFile(uri: String): ILuaFile?
     fun removeFile(uri: String)
+    fun removeFileIfNeeded(uri: String)
     fun eachRoot(processor: (f: IFolder) -> Boolean)
     companion object {
         val KEY = Key.create<IWorkspace>("emmy.workspace")
@@ -38,11 +39,12 @@ interface IFolder : IVirtualFile {
 interface IVirtualFile {
     val isFolder: Boolean
     fun getName(): String
-    val path: Path
-    val uri get() = path.toUri()
+    val uri: FileURI
     val parent: IFolder
     fun matchUri(uri: URI): Boolean
 }
+
+data class Word(val hashCode: Int, val start: Int, val end: Int)
 
 interface ILuaFile : IVirtualFile {
     fun getText(): CharSequence
@@ -52,4 +54,5 @@ interface ILuaFile : IVirtualFile {
     fun getLine(offset: Int): Pair<Int, Int>
     fun didChange(params: DidChangeTextDocumentParams)
     fun getPosition(line:Int, char: Int): Int
+    fun processWords(processor: (w: Word) -> Boolean)
 }

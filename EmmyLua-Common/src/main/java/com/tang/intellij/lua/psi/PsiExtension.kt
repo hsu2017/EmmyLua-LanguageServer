@@ -26,8 +26,8 @@ import com.intellij.psi.util.CachedValuesManager
 import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.util.Processor
 import com.tang.intellij.lua.comment.LuaCommentUtil
-import com.tang.intellij.lua.comment.psi.LuaDocTagClass
 import com.tang.intellij.lua.comment.psi.LuaDocGenericDef
+import com.tang.intellij.lua.comment.psi.LuaDocTagClass
 import com.tang.intellij.lua.comment.psi.LuaDocTagOverload
 import com.tang.intellij.lua.comment.psi.api.LuaComment
 import com.tang.intellij.lua.lang.type.LuaString
@@ -44,7 +44,6 @@ import com.tang.intellij.lua.ty.*
  * this table should be `MyClass`
  *
  * 2.
- *
  * ---@param callback fun(sender: any, type: string):void
  * local function addListener(type, callback)
  *      ...
@@ -53,8 +52,18 @@ import com.tang.intellij.lua.ty.*
  * addListener(function() end)
  *
  * this closure should be `fun(sender: any, type: string):void`
+ *
+ * 3.
+ * ---@class MyClass
+ * ---@field foo Bar
+ * local a = {}
+ *
+ * ---@type MyClass
+ * local tbl = {
+ *     foo = ?? -- foo should be type of `Bar`
+ * }
  */
-fun LuaExpr.shouldBe(context: SearchContext): ITy {
+private fun LuaExpr.shouldBeInternal(context: SearchContext): ITy {
     val p1 = parent
     if (p1 is LuaExprList) {
         val p2 = p1.parent
@@ -67,7 +76,7 @@ fun LuaExpr.shouldBe(context: SearchContext): ITy {
             if (receiver != null)
                 return infer(receiver, context)
         }
-    } else if (p1 is LuaListArgs) {
+    } else if (p1 is LuaArgs) {
         val p2 = p1.parent
         if (p2 is LuaCallExpr) {
             val idx = p1.getIndexFor(this)
@@ -84,8 +93,25 @@ fun LuaExpr.shouldBe(context: SearchContext): ITy {
             }
             return ret
         }
+    } else if (p1 is LuaTableField) {
+        val fieldName = p1.name
+        val tbl = p1.parent
+        if (fieldName != null && tbl is LuaTableExpr) {
+            var fieldType: ITy = Ty.UNKNOWN
+            val tyTbl = tbl.shouldBe(context)
+            tyTbl.eachTopClass(Processor { cls ->
+                cls.findMemberType(fieldName, context)?.let { fieldType = fieldType.union(it) }
+                true
+            })
+            return fieldType
+        }
     }
     return Ty.UNKNOWN
+}
+
+fun LuaExpr.shouldBe(context: SearchContext): ITy {
+    val ty = shouldBeInternal(context)
+    return TyAliasSubstitutor.substitute(ty, context)
 }
 
 /**
@@ -148,7 +174,9 @@ fun LuaAssignStat.getExprAt(index:Int) : LuaExpr? {
     return list.getOrNull(index)
 }
 
-fun LuaListArgs.getIndexFor(psi: LuaExpr): Int {
+fun LuaArgs.getIndexFor(psi: LuaExpr): Int {
+    if (this is LuaSingleArg)
+        return 0
     var idx = 0
     LuaPsiTreeUtilEx.processChildren(this, Processor {
         if (it is LuaExpr) {
@@ -424,6 +452,14 @@ val LuaFuncDef.forwardDeclaration: PsiElement? get() {
     }
 }
 
+val LuaCallExpr.prefixExpr: LuaExpr? get() {
+    val expr = this.expr
+    if (expr is LuaIndexExpr) {
+        return expr.prefixExpr
+    }
+    return null
+}
+
 val LuaCallExpr.argList: List<LuaExpr> get() {
     val args = this.args
     return when (args) {
@@ -444,19 +480,13 @@ val LuaBinaryExpr.right: LuaExpr? get() {
 
 fun LuaClassMethod.findOverridingMethod(context: SearchContext): LuaClassMethod? {
     val methodName = name ?: return null
-
     val type = guessClassType(context) ?: return null
-    var superType = type.getSuperClass(context)
-
-    while (superType != null && superType is TyClass) {
+    var superMethod: LuaClassMethod? = null
+    TyClass.processSuperClass(type, context) { superType->
         ProgressManager.checkCanceled()
         val superTypeName = superType.className
-        val superMethod = LuaClassMemberIndex.findMethod(superTypeName, methodName, context)
-        if (superMethod != null) {
-            return superMethod
-        }
-        superType = superType.getSuperClass(context)
+        superMethod = LuaClassMemberIndex.findMethod(superTypeName, methodName, context)
+        superMethod == null
     }
-
-    return null
+    return superMethod
 }

@@ -1,7 +1,6 @@
 package com.tang.vscode
 
 import com.google.gson.JsonPrimitive
-import com.intellij.openapi.project.ProjectCoreUtil
 import com.intellij.openapi.util.TextRange
 import com.intellij.psi.PsiElement
 import com.intellij.psi.search.GlobalSearchScope
@@ -19,14 +18,18 @@ import com.tang.intellij.lua.editor.completion.asCompletionItem
 import com.tang.intellij.lua.psi.*
 import com.tang.intellij.lua.reference.ReferencesSearch
 import com.tang.intellij.lua.search.SearchContext
-import com.tang.intellij.lua.stubs.index.LuaClassMemberIndex
 import com.tang.intellij.lua.ty.ITyFunction
 import com.tang.intellij.lua.ty.findPerfectSignature
 import com.tang.intellij.lua.ty.process
-import com.tang.vscode.api.ILuaFile
+import com.tang.lsp.ILuaFile
+import com.tang.lsp.getRangeInFile
+import com.tang.lsp.nameRange
+import com.tang.lsp.toRange
 import com.tang.vscode.api.impl.LuaFile
 import com.tang.vscode.documentation.LuaDocumentationProvider
-import com.tang.vscode.utils.*
+import com.tang.vscode.utils.TargetElementUtil
+import com.tang.vscode.utils.computeAsync
+import com.tang.vscode.utils.getDocumentSymbols
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.messages.Either
 import org.eclipse.lsp4j.jsonrpc.services.JsonRequest
@@ -81,9 +84,8 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
                 if (o.parent is LuaExprStat) // non-complete stat
                     return
 
-                val context = SearchContext(o.project)
-                val resolve = resolveInFile(o.name, o, context)
-                when (resolve) {
+                val context = SearchContext.get(o.project)
+                when (resolveInFile(o.name, o, context)) {
                     is LuaParamNameDef -> params.add(o.textRange)
                     is LuaFuncDef -> globals.add(o.textRange)
                     is LuaNameDef -> {} //local
@@ -148,16 +150,18 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
             if (data is JsonPrimitive) {
                 val arr = data.asString.split("|")
                 if (arr.size >= 2) {
-                    val cls = arr[0]
-                    val name = arr[1]
-                    LuaClassMemberIndex.process(cls, name, SearchContext(workspace.project), Processor { member ->
-                        val doc = documentProvider.generateDoc(member, member)
-                        val content = MarkupContent()
-                        content.kind = "markdown"
-                        content.value = doc
-                        item.documentation = Either.forRight(content)
-                        false
-                    })
+                    workspace.findLuaFile(arr[0])?.let { file->
+                        val position = arr[1].toInt()
+                        file.psi?.findElementAt(position)?.let { psi ->
+                            PsiTreeUtil.getParentOfType(psi, LuaClassMember::class.java)?.let { member ->
+                                val doc = documentProvider.generateDoc(member, member)
+                                val content = MarkupContent()
+                                content.kind = "markdown"
+                                content.value = doc
+                                item.documentation = Either.forRight(content)
+                            }
+                        }
+                    }
                 }
             }
             item
@@ -220,9 +224,9 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
                 val target = TargetElementUtil.findTarget(psiFile, i)
                 val resolve = target?.reference?.resolve()
                 if (resolve != null) {
-                    val sourceFile = resolve.containingFile.virtualFile as LuaFile
+                    val sourceFile = resolve.containingFile?.virtualFile as? LuaFile
                     val range = resolve.nameRange
-                    if (range != null)
+                    if (range != null && sourceFile != null)
                         list.add(Location(sourceFile.uri.toString(), range.toRange(sourceFile)))
                 }
             }
@@ -238,7 +242,7 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
     override fun codeLens(params: CodeLensParams): CompletableFuture<MutableList<out CodeLens>> {
         return computeAsync { cc->
             val list = mutableListOf<CodeLens>()
-            if (Configuration.showCodeLens) {
+            if (VSCodeSettings.showCodeLens) {
                 workspace.findFile(params.textDocument.uri)?.let {
                     val luaFile = it as? ILuaFile
                     luaFile?.psi?.acceptChildren(object : LuaVisitor() {
@@ -317,7 +321,7 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
                     list.add(TextEdit(reference.getRangeInFile(refFile), params.newName))
                 }
 
-                map.forEach { t, u ->
+                map.forEach { (t, u) ->
                     val documentIdentifier = VersionedTextDocumentIdentifier()
                     documentIdentifier.uri = t
                     changes.add(TextDocumentEdit(documentIdentifier, u))
@@ -337,7 +341,7 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
                 val pos = file.getPosition(position.position.line, position.position.character)
                 val psi = file.psi
                 if (psi != null) {
-                    CompletionService.collectCompletion(psi, pos, Configuration, Consumer {
+                    CompletionService.collectCompletion(psi, pos, Consumer {
                         checker.checkCanceled()
                         list.items.add(it.asCompletionItem)
                     })
@@ -367,7 +371,7 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
         var file = workspace.findFile(uri)
         if (file == null) {
             val u = URI(uri)
-            file = workspace.addFile(File(u.path), params.textDocument.text)
+            file = workspace.addFile(File(u.path), params.textDocument.text, true)
         }
         if (file is LuaFile) {
             val diagnosticsParams = PublishDiagnosticsParams(params.textDocument.uri, file.diagnostics)
@@ -398,26 +402,28 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
                     }
                 }
 
-                callExpr?.guessParentType(SearchContext(psiFile.project))?.let { ty ->
-                    if (ty is ITyFunction) {
-                        val active = ty.findPerfectSignature(nCommas + 1)
-                        var idx = 0
-                        ty.process(Processor { sig ->
-                            val information = SignatureInformation()
-                            information.parameters = mutableListOf()
-                            sig.params.forEach { pi ->
-                                val paramInfo = ParameterInformation("${pi.name}:${pi.ty.displayName}", pi.ty.displayName)
-                                information.parameters.add(paramInfo)
-                            }
-                            information.label = sig.displayName
-                            list.add(information)
+                callExpr?.guessParentType(SearchContext.get(psiFile.project))?.let { parentType ->
+                    parentType.each { ty->
+                        if (ty is ITyFunction) {
+                            val active = ty.findPerfectSignature(nCommas + 1)
+                            var idx = 0
+                            ty.process(Processor { sig ->
+                                val information = SignatureInformation()
+                                information.parameters = mutableListOf()
+                                sig.params.forEach { pi ->
+                                    val paramInfo = ParameterInformation("${pi.name}:${pi.ty.displayName}", pi.ty.displayName)
+                                    information.parameters.add(paramInfo)
+                                }
+                                information.label = sig.displayName
+                                list.add(information)
 
-                            if (sig == active) {
-                                activeSig = idx
-                            }
-                            idx++
-                            true
-                        })
+                                if (sig == active) {
+                                    activeSig = idx
+                                }
+                                idx++
+                                true
+                            })
+                        }
                     }
                 }
             }
@@ -426,7 +432,7 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
     }
 
     override fun didClose(params: DidCloseTextDocumentParams) {
-
+        workspace.removeFileIfNeeded(params.textDocument.uri)
     }
 
     override fun formatting(params: DocumentFormattingParams?): CompletableFuture<MutableList<out TextEdit>> {
@@ -471,9 +477,5 @@ class LuaTextDocumentService(private val workspace: LuaWorkspaceService) : TextD
                 code(file, psi, pos)
             }
         }
-    }
-
-    fun initIntellijEnv() {
-        ProjectCoreUtil.theProject = workspace.project
     }
 }

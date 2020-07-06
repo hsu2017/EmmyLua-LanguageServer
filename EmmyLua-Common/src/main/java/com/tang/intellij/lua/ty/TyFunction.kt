@@ -22,10 +22,7 @@ import com.intellij.util.Processor
 import com.tang.intellij.lua.comment.psi.LuaDocFunctionTy
 import com.tang.intellij.lua.psi.*
 import com.tang.intellij.lua.search.SearchContext
-import com.tang.intellij.lua.stubs.readParamInfoArray
-import com.tang.intellij.lua.stubs.readTyNullable
-import com.tang.intellij.lua.stubs.writeParamInfoArray
-import com.tang.intellij.lua.stubs.writeTyNullable
+import com.tang.intellij.lua.stubs.*
 
 interface IFunSignature {
     val colonCall: Boolean
@@ -42,7 +39,7 @@ interface IFunSignature {
 fun IFunSignature.processArgs(callExpr: LuaCallExpr, processor: (index:Int, param: LuaParamInfo) -> Boolean) {
     val expr = callExpr.expr
     val thisTy = if (expr is LuaIndexExpr) {
-        expr.guessType(SearchContext(expr.project))
+        expr.guessType(SearchContext.get(expr.project))
     } else null
     processArgs(thisTy, callExpr.isMethodColonCall, processor)
 }
@@ -62,6 +59,15 @@ fun IFunSignature.processArgs(thisTy: ITy?, colonStyle: Boolean, processor: (ind
     }
 }
 
+fun IFunSignature.processArgs(processor: (index:Int, param: LuaParamInfo) -> Boolean) {
+    var index = 0
+    if (colonCall)
+        index++
+    for (i in params.indices) {
+        if (!processor(index++, params[i])) return
+    }
+}
+
 fun IFunSignature.processParams(thisTy: ITy?, colonStyle: Boolean, processor: (index:Int, param: LuaParamInfo) -> Boolean) {
     var index = 0
     if (colonCall) {
@@ -69,8 +75,8 @@ fun IFunSignature.processParams(thisTy: ITy?, colonStyle: Boolean, processor: (i
         if (!processor(index++, pi)) return
     }
 
-    for (i in 0 until params.size) {
-        if (!processor(index++, params[i])) return
+    for (element in params) {
+        if (!processor(index++, element)) return
     }
 }
 
@@ -135,11 +141,15 @@ abstract class FunSignatureBase(override val colonCall: Boolean,
 
     override fun substitute(substitutor: ITySubstitutor): IFunSignature {
         val list = params.map { it.substitute(substitutor) }
-        return FunSignature(colonCall, returnTy.substitute(substitutor), varargTy?.substitute(substitutor), list.toTypedArray())
+        return FunSignature(colonCall,
+                returnTy.substitute(substitutor),
+                varargTy?.substitute(substitutor),
+                list.toTypedArray(),
+                tyParameters)
     }
 
     override fun subTypeOf(other: IFunSignature, context: SearchContext, strict: Boolean): Boolean {
-        for (i in 0 until params.size) {
+        for (i in params.indices) {
             val p1 = params[i]
             val p2 = other.params.getOrNull(i) ?: return false
             if (!p1.ty.subTypeOf(p2.ty, context, strict))
@@ -258,7 +268,7 @@ abstract class TyFunction : Ty(TyKind.Function), ITyFunction {
     }
 
     override fun subTypeOf(other: ITy, context: SearchContext, strict: Boolean): Boolean {
-        if (super.subTypeOf(other, context, strict) || other == Ty.FUNCTION)
+        if (super.subTypeOf(other, context, strict) || other == FUNCTION)
             return true // Subtype of function primitive.
 
         var matched = false
@@ -295,7 +305,7 @@ class TyPsiFunction(private val colonCall: Boolean, val psi: LuaFuncBodyOwner, f
 
         object : FunSignatureBase(colonCall, psi.params, psi.tyParams) {
             override val returnTy: ITy by lazy {
-                var returnTy = psi.guessReturnType(SearchContext(psi.project))
+                var returnTy = psi.guessReturnType(SearchContext.get(psi.project))
                 /**
                  * todo optimize this bug solution
                  * local function test()
@@ -304,7 +314,7 @@ class TyPsiFunction(private val colonCall: Boolean, val psi: LuaFuncBodyOwner, f
                  * -- will crash after type `test`
                  */
                 if (returnTy is TyPsiFunction && returnTy.psi == psi) {
-                    returnTy = Ty.UNKNOWN
+                    returnTy = UNKNOWN
                 }
 
                 returnTy
@@ -331,5 +341,18 @@ class TySerializedFunction(override val mainSignature: IFunSignature,
                            flags: Int = 0) : TyFunction() {
     init {
         this.flags = flags
+    }
+}
+
+object TyFunctionSerializer : TySerializer<ITyFunction>() {
+    override fun deserializeTy(flags: Int, stream: StubInputStream): ITyFunction {
+        val mainSig = FunSignature.deserialize(stream)
+        val arr = stream.readSignatures()
+        return TySerializedFunction(mainSig, arr, flags)
+    }
+
+    override fun serializeTy(ty: ITyFunction, stream: StubOutputStream) {
+        FunSignature.serialize(ty.mainSignature, stream)
+        stream.writeSignatures(ty.signatures)
     }
 }

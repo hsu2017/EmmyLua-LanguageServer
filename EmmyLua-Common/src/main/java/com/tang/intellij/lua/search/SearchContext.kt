@@ -18,23 +18,102 @@ package com.tang.intellij.lua.search
 
 import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
+import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.ProjectAndLibrariesScope
+import com.tang.intellij.lua.ext.ILuaTypeInfer
+import com.tang.intellij.lua.psi.LuaTypeGuessable
+import com.tang.intellij.lua.ty.ITy
+import com.tang.intellij.lua.ty.Ty
+import java.util.*
 
 /**
 
  * Created by tangzx on 2017/1/14.
  */
-class SearchContext(val project: Project, private val currentFile: PsiFile? = null, var forStore: Boolean = false) {
-    constructor(project: Project) : this(project, null)
+class SearchContext private constructor(val project: Project) {
+
+    companion object {
+        private val threadLocal = object : ThreadLocal<Stack<SearchContext>>() {
+            override fun initialValue(): Stack<SearchContext> {
+                return Stack()
+            }
+        }
+
+        fun get(project: Project): SearchContext {
+            val stack = threadLocal.get()
+            return if (stack.isEmpty()) {
+                SearchContext(project)
+            } else {
+                stack.peek()
+            }
+        }
+
+        fun infer(psi: LuaTypeGuessable): ITy {
+            return with(psi.project) { it.inferAndCache(psi) }
+        }
+
+        fun infer(psi: LuaTypeGuessable, context: SearchContext): ITy {
+            return with(context, Ty.UNKNOWN) { it.inferAndCache(psi) }
+        }
+
+        private fun <T> with(ctx: SearchContext, defaultValue: T, action: (ctx: SearchContext) -> T): T {
+            return if (ctx.myInStack) {
+                action(ctx)
+            } else {
+                val stack = threadLocal.get()
+                val size = stack.size
+                stack.push(ctx)
+                ctx.myInStack = true
+                val result = try {
+                    action(ctx)
+                } catch (e: Exception) {
+                    defaultValue
+                }
+                ctx.myInStack = false
+                stack.pop()
+                assert(size == stack.size)
+                result
+            }
+        }
+
+        private fun <T> with(project: Project, action: (ctx: SearchContext) -> T): T {
+            val ctx = get(project)
+            return with(ctx, action)
+        }
+
+        fun <T> withStub(project: Project, file: PsiFile, defaultValue: T, action: (ctx: SearchContext) -> T): T {
+            val context = SearchContext(project)
+            return withStub(context, defaultValue, action)
+        }
+
+        private fun <T> withStub(ctx: SearchContext, defaultValue: T, action: (ctx: SearchContext) -> T): T {
+            return with(ctx, defaultValue) {
+                val dumb = it.myDumb
+                val stub = it.myForStub
+                it.myDumb = true
+                it.myForStub = true
+                val ret = action(it)
+                it.myDumb = dumb
+                it.myForStub = stub
+                ret
+            }
+        }
+    }
 
     /**
      * 用于有多返回值的索引设定
      */
     val index: Int get() = myIndex
 
-    private var myIndex: Int = -1
+    private var myDumb = false
+    private var myForStub = false
+    private var myIndex = -1
+    private var myInStack = false
+    private val myGuardList = mutableListOf<InferRecursionGuard>()
+    private val myInferCache = mutableMapOf<LuaTypeGuessable, ITy>()
+    private var myScope: GlobalSearchScope? = null
 
     fun <T> withIndex(index: Int, action: () -> T): T {
         val savedIndex = this.index
@@ -46,21 +125,53 @@ class SearchContext(val project: Project, private val currentFile: PsiFile? = nu
 
     fun guessTuple() = index < 0
 
-    private var scope: GlobalSearchScope? = null
-
-    fun getScope(): GlobalSearchScope {
-        if (scope == null) {
-            scope = if (isDumb) {
-                GlobalSearchScope.EMPTY_SCOPE
-            } else {
-                ProjectAndLibrariesScope(project)
-            }
+    val scope get(): GlobalSearchScope {
+        if (isDumb)
+            return GlobalSearchScope.EMPTY_SCOPE
+        if (myScope == null) {
+            myScope = ProjectAndLibrariesScope(project)
         }
-        return scope!!
+        return myScope!!
     }
 
     val isDumb: Boolean
-        get() = DumbService.isDumb(project) || currentFile != null
+        get() = myDumb || DumbService.isDumb(project)
 
-    fun clone() = SearchContext(project, currentFile)
+    val forStub get() = myForStub
+
+    fun <T> withScope(scope: GlobalSearchScope, action: () -> T): T {
+        val oriScope = myScope
+        myScope = scope
+        val ret = action()
+        myScope = oriScope
+        return ret
+    }
+
+    fun withRecursionGuard(psi: PsiElement, type: GuardType, action: () -> ITy): ITy {
+        myGuardList.forEach {
+            if (it.check(psi, type)) {
+                return Ty.UNKNOWN
+            }
+        }
+        val guard = createGuard(psi, type)
+        if (guard != null)
+            myGuardList.add(guard)
+        val result = action()
+        if (guard != null)
+            myGuardList.remove(guard)
+        return result
+    }
+
+    private fun inferAndCache(psi: LuaTypeGuessable): ITy {
+        /*if (inferCache.containsKey(psi)) {
+            println("use cache!!!")
+        }*/
+        return myInferCache.getOrPut(psi) {
+            ILuaTypeInfer.infer(psi, this)
+        }
+    }
+
+    fun getTypeFromCache(psi: LuaTypeGuessable): ITy {
+        return myInferCache.getOrElse(psi) { Ty.UNKNOWN }
+    }
 }

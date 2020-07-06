@@ -61,9 +61,12 @@ class LuaCompletionContributor : CompletionContributor() {
         })
 
         extend(CompletionType.BASIC, psiElement(LuaTypes.ID).withParent(LuaNameDef::class.java), SuggestLocalNameProvider())
+        */
 
-        extend(CompletionType.BASIC, IN_TABLE_FIELD, TableCompletionProvider())*/
+        extend(CompletionType.BASIC, IN_TABLE_FIELD, TableCompletionProvider())
 
+        // require 路径提示
+        extend(CompletionType.BASIC, SHOW_REQUIRE_PATH, RequirePathCompletionProvider())
         //提示属性, 提示方法
         extend(CompletionType.BASIC, SHOW_CLASS_FIELD, ClassMemberCompletionProvider())
         //提示全局函数,local变量,local函数
@@ -80,7 +83,7 @@ class LuaCompletionContributor : CompletionContributor() {
     }*/
 
     override fun beforeCompletion(context: CompletionInitializationContext) {
-        /*suggestWords = true
+        suggestWords = true
         val file = context.file
         if (file is LuaPsiFile) {
             val element = file.findElementAt(context.caret.offset - 1)
@@ -98,7 +101,7 @@ class LuaCompletionContributor : CompletionContributor() {
                     }
                 }
             }
-        }*/
+        }
     }
 
     companion object {
